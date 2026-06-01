@@ -1,0 +1,332 @@
+TO SET UP MONITORING FOR YOUTUBE
+#!/bin/bash
+# ============================================================
+#  Google Cloud Monitoring — YouTube Application Setup
+#  Monitors: video streaming, CDN, transcoding, API, upload
+#  Usage: bash setup_youtube_monitoring.sh [PROJECT_ID] [ALERT_EMAIL]
+# ============================================================
+
+set -euo pipefail
+
+PROJECT_ID="${1:-youtube-prod}"
+ALERT_EMAIL="${2:-sre-alerts@youtube.com}"
+APP_NAME="youtube"
+REGION="us-central1"
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
+success() { echo -e "${GREEN}[OK]${NC}    $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
+
+check_prerequisites() {
+  info "Checking prerequisites..."
+  command -v gcloud >/dev/null || error "gcloud CLI not found."
+  gcloud auth list --filter=status:ACTIVE --format="value(account)" | grep -q . \
+    || error "Run: gcloud auth login"
+  gcloud config set project "${PROJECT_ID}"
+  success "Prerequisites OK."
+}
+
+enable_apis() {
+  info "Enabling APIs..."
+  gcloud services enable \
+    monitoring.googleapis.com \
+    logging.googleapis.com \
+    cloudtrace.googleapis.com \
+    clouderrorreporting.googleapis.com \
+    run.googleapis.com \
+    pubsub.googleapis.com \
+    --quiet
+  success "APIs enabled."
+}
+
+create_notification_channels() {
+  info "Creating notification channels..."
+
+  # Email — general alerts
+  EMAIL_CH=$(gcloud alpha monitoring channels create \
+    --display-name="YouTube SRE Email" \
+    --type=email \
+    --channel-labels="email_address=${ALERT_EMAIL}" \
+    --format="value(name)" 2>/dev/null || echo "")
+
+  # PagerDuty — critical only (fill in your key)
+  PD_CH=$(gcloud alpha monitoring channels create \
+    --display-name="YouTube PagerDuty" \
+    --type=pagerduty \
+    --channel-labels="service_key=YOUR_PAGERDUTY_KEY" \
+    --format="value(name)" 2>/dev/null || echo "")
+
+  # Slack
+  SLACK_CH=$(gcloud alpha monitoring channels create \
+    --display-name="YouTube #sre-alerts Slack" \
+    --type=slack \
+    --channel-labels="channel_name=#sre-alerts,auth_token=YOUR_SLACK_TOKEN" \
+    --format="value(name)" 2>/dev/null || echo "")
+
+  echo "EMAIL_CH=${EMAIL_CH}" > /tmp/yt_monitoring_env
+  echo "PD_CH=${PD_CH}" >> /tmp/yt_monitoring_env
+  echo "SLACK_CH=${SLACK_CH}" >> /tmp/yt_monitoring_env
+  success "Notification channels created."
+}
+
+create_alert_policies() {
+  info "Creating YouTube-specific alert policies..."
+  source /tmp/yt_monitoring_env 2>/dev/null || { EMAIL_CH=""; PD_CH=""; SLACK_CH=""; }
+
+  ALL_CH="[\"${EMAIL_CH}\",\"${PD_CH}\",\"${SLACK_CH}\"]"
+  EMAIL_ONLY="[\"${EMAIL_CH}\"]"
+
+  # ── 1. Video buffering ratio > 1% (CRITICAL) ─────────────
+  gcloud alpha monitoring policies create --policy-from-file=- --quiet <<EOF 2>/dev/null || warn "Policy 1 skipped"
+{
+  "displayName": "YouTube — Video Buffering Ratio High",
+  "documentation": {
+    "content": "Video buffering ratio exceeded 1% — users experiencing stalls. Check CDN health, origin servers, and transcode pipeline.",
+    "mimeType": "text/markdown"
+  },
+  "conditions": [{
+    "displayName": "Buffering ratio > 1%",
+    "conditionThreshold": {
+      "filter": "resource.type=\"global\" metric.type=\"custom.googleapis.com/youtube/buffering_ratio\"",
+      "aggregations": [{ "alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_MEAN" }],
+      "comparison": "COMPARISON_GT", "thresholdValue": 0.01, "duration": "120s"
+    }
+  }],
+  "combiner": "OR", "enabled": true,
+  "notificationChannels": ${ALL_CH}, "severity": "CRITICAL"
+}
+EOF
+
+  # ── 2. CDN cache hit ratio < 85% ─────────────────────────
+  gcloud alpha monitoring policies create --policy-from-file=- --quiet <<EOF 2>/dev/null || warn "Policy 2 skipped"
+{
+  "displayName": "YouTube — CDN Cache Hit Ratio Low",
+  "documentation": {
+    "content": "CDN cache hit ratio dropped below 85%. Increased origin load and latency for viewers. Review cache TTL and invalidation rules.",
+    "mimeType": "text/markdown"
+  },
+  "conditions": [{
+    "displayName": "CDN cache hit < 85%",
+    "conditionThreshold": {
+      "filter": "resource.type=\"https_lb_rule\" metric.type=\"loadbalancing.googleapis.com/https/backend_request_count\"",
+      "aggregations": [{ "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_RATE" }],
+      "comparison": "COMPARISON_LT", "thresholdValue": 0.85, "duration": "300s"
+    }
+  }],
+  "combiner": "OR", "enabled": true,
+  "notificationChannels": ${EMAIL_ONLY}, "severity": "WARNING"
+}
+EOF
+
+  # ── 3. Video API error rate > 0.5% ───────────────────────
+  gcloud alpha monitoring policies create --policy-from-file=- --quiet <<EOF 2>/dev/null || warn "Policy 3 skipped"
+{
+  "displayName": "YouTube — Video API 5xx Error Rate High",
+  "documentation": {
+    "content": "API 5xx error rate exceeded 0.5%. Playback, search, or upload APIs may be degraded.",
+    "mimeType": "text/markdown"
+  },
+  "conditions": [{
+    "displayName": "API 5xx > 0.5%",
+    "conditionThreshold": {
+      "filter": "resource.type=\"gce_instance\" metric.type=\"custom.googleapis.com/youtube/api_error_rate\"",
+      "aggregations": [{ "alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_MEAN" }],
+      "comparison": "COMPARISON_GT", "thresholdValue": 0.005, "duration": "120s"
+    }
+  }],
+  "combiner": "OR", "enabled": true,
+  "notificationChannels": ${ALL_CH}, "severity": "ERROR"
+}
+EOF
+
+  # ── 4. Transcode queue depth > 500 jobs ──────────────────
+  gcloud alpha monitoring policies create --policy-from-file=- --quiet <<EOF 2>/dev/null || warn "Policy 4 skipped"
+{
+  "displayName": "YouTube — Transcode Queue Backlog",
+  "documentation": {
+    "content": "Transcode queue depth exceeds 500 jobs. Upload processing may be delayed. Scale transcode workers via Cloud Run.",
+    "mimeType": "text/markdown"
+  },
+  "conditions": [{
+    "displayName": "Transcode queue > 500",
+    "conditionThreshold": {
+      "filter": "resource.type=\"pubsub_subscription\" resource.labels.subscription_id=\"transcode-jobs\" metric.type=\"pubsub.googleapis.com/subscription/num_undelivered_messages\"",
+      "aggregations": [{ "alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_MEAN" }],
+      "comparison": "COMPARISON_GT", "thresholdValue": 500, "duration": "120s"
+    }
+  }],
+  "combiner": "OR", "enabled": true,
+  "notificationChannels": ${EMAIL_ONLY}, "severity": "WARNING"
+}
+EOF
+
+  # ── 5. p95 video start latency > 3s ──────────────────────
+  gcloud alpha monitoring policies create --policy-from-file=- --quiet <<EOF 2>/dev/null || warn "Policy 5 skipped"
+{
+  "displayName": "YouTube — High Video Start Latency",
+  "documentation": {
+    "content": "p95 time-to-first-frame exceeded 3 seconds. High start latency hurts viewer retention. Check manifest server and CDN edge performance.",
+    "mimeType": "text/markdown"
+  },
+  "conditions": [{
+    "displayName": "p95 start latency > 3s",
+    "conditionThreshold": {
+      "filter": "resource.type=\"global\" metric.type=\"custom.googleapis.com/youtube/video_start_latency\"",
+      "aggregations": [{ "alignmentPeriod": "120s", "perSeriesAligner": "ALIGN_PERCENTILE_95" }],
+      "comparison": "COMPARISON_GT", "thresholdValue": 3000, "duration": "120s"
+    }
+  }],
+  "combiner": "OR", "enabled": true,
+  "notificationChannels": ${EMAIL_ONLY}, "severity": "WARNING"
+}
+EOF
+
+  # ── 6. Concurrent viewers drop > 20% in 5 min ────────────
+  gcloud alpha monitoring policies create --policy-from-file=- --quiet <<EOF 2>/dev/null || warn "Policy 6 skipped"
+{
+  "displayName": "YouTube — Concurrent Viewer Sudden Drop",
+  "documentation": {
+    "content": "Concurrent active viewers dropped more than 20% in 5 minutes — possible platform outage or widespread playback failure.",
+    "mimeType": "text/markdown"
+  },
+  "conditions": [{
+    "displayName": "Viewer drop > 20%",
+    "conditionThreshold": {
+      "filter": "resource.type=\"global\" metric.type=\"custom.googleapis.com/youtube/concurrent_viewers\"",
+      "aggregations": [{ "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_MEAN" }],
+      "comparison": "COMPARISON_LT", "thresholdValue": 0.80, "duration": "300s"
+    }
+  }],
+  "combiner": "OR", "enabled": true,
+  "notificationChannels": ${ALL_CH}, "severity": "CRITICAL"
+}
+EOF
+
+  # ── 7. Upload failure rate > 2% ──────────────────────────
+  gcloud alpha monitoring policies create --policy-from-file=- --quiet <<EOF 2>/dev/null || warn "Policy 7 skipped"
+{
+  "displayName": "YouTube — High Upload Failure Rate",
+  "documentation": {
+    "content": "Upload failure rate exceeded 2%. Check GCS ingestion pipeline, resumable upload endpoints, and storage quota.",
+    "mimeType": "text/markdown"
+  },
+  "conditions": [{
+    "displayName": "Upload failures > 2%",
+    "conditionThreshold": {
+      "filter": "resource.type=\"global\" metric.type=\"custom.googleapis.com/youtube/upload_failure_rate\"",
+      "aggregations": [{ "alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_MEAN" }],
+      "comparison": "COMPARISON_GT", "thresholdValue": 0.02, "duration": "120s"
+    }
+  }],
+  "combiner": "OR", "enabled": true,
+  "notificationChannels": ${EMAIL_ONLY}, "severity": "WARNING"
+}
+EOF
+
+  # ── 8. Cloud Run (transcode workers) CPU > 85% ───────────
+  gcloud alpha monitoring policies create --policy-from-file=- --quiet <<EOF 2>/dev/null || warn "Policy 8 skipped"
+{
+  "displayName": "YouTube — Transcode Worker CPU High",
+  "documentation": {
+    "content": "Cloud Run transcode workers exceeding 85% CPU. Auto-scaling may not keep up. Review min/max instance config.",
+    "mimeType": "text/markdown"
+  },
+  "conditions": [{
+    "displayName": "Transcode CPU > 85%",
+    "conditionThreshold": {
+      "filter": "resource.type=\"cloud_run_revision\" resource.labels.service_name=\"youtube-transcode\" metric.type=\"run.googleapis.com/container/cpu/utilizations\"",
+      "aggregations": [{ "alignmentPeriod": "300s", "perSeriesAligner": "ALIGN_PERCENTILE_99" }],
+      "comparison": "COMPARISON_GT", "thresholdValue": 0.85, "duration": "300s"
+    }
+  }],
+  "combiner": "OR", "enabled": true,
+  "notificationChannels": ${EMAIL_ONLY}, "severity": "WARNING"
+}
+EOF
+
+  success "Alert policies created (8 total)."
+}
+
+create_uptime_checks() {
+  info "Creating uptime checks..."
+
+  for endpoint in "www.youtube.com:/" "upload.youtube.com:/upload/youtube" "i.ytimg.com:/vi/test.jpg"; do
+    HOST="${endpoint%%:*}"
+    PATH="${endpoint##*:}"
+    gcloud alpha monitoring uptime create \
+      --display-name="YouTube ${HOST}" \
+      --resource-type=uptime_url \
+      --resource-labels="host=${HOST},project_id=${PROJECT_ID}" \
+      --http-check-path="${PATH}" \
+      --period=60 --timeout=10 \
+      --regions="usa,europe,asia-pacific" \
+      --quiet 2>/dev/null \
+      && success "Uptime check: ${HOST}" \
+      || warn "Uptime check ${HOST}: run manually."
+  done
+}
+
+create_log_metrics() {
+  info "Creating log-based metrics..."
+
+  gcloud logging metrics create "youtube_playback_errors" \
+    --description="Count of video playback error log entries" \
+    --log-filter="resource.type=\"gce_instance\" jsonPayload.event=\"playback_error\"" \
+    --quiet 2>/dev/null || warn "Metric playback_errors already exists."
+
+  gcloud logging metrics create "youtube_upload_failures" \
+    --description="Count of upload failure events" \
+    --log-filter="resource.type=\"gce_instance\" jsonPayload.event=\"upload_failed\"" \
+    --quiet 2>/dev/null || warn "Metric upload_failures already exists."
+
+  gcloud logging metrics create "youtube_transcode_failures" \
+    --description="Count of failed transcode jobs" \
+    --log-filter="resource.type=\"cloud_run_revision\" jsonPayload.status=\"transcode_failed\"" \
+    --quiet 2>/dev/null || warn "Metric transcode_failures already exists."
+
+  success "Log-based metrics created."
+}
+
+print_summary() {
+  echo ""
+  echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
+  echo -e "${GREEN}${BOLD}║     YouTube Cloud Monitoring Setup Complete ✅           ║${NC}"
+  echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════════════════════╝${NC}"
+  echo ""
+  echo "  Project  : ${PROJECT_ID}"
+  echo "  Alerts → : ${ALERT_EMAIL}"
+  echo ""
+  echo "  Alert Policies (8):"
+  echo "    🔴 Video buffering ratio          (> 1%)        CRITICAL"
+  echo "    🟡 CDN cache hit ratio            (< 85%)       WARNING"
+  echo "    🔴 API 5xx error rate             (> 0.5%)      ERROR"
+  echo "    🟡 Transcode queue backlog        (> 500 jobs)  WARNING"
+  echo "    🟡 Video start latency p95        (> 3 s)       WARNING"
+  echo "    🔴 Concurrent viewer sudden drop  (> 20%)       CRITICAL"
+  echo "    🟡 Upload failure rate            (> 2%)        WARNING"
+  echo "    🟡 Transcode worker CPU           (> 85%)       WARNING"
+  echo ""
+  echo "  Uptime Checks (3 endpoints × 3 regions):"
+  echo "    www.youtube.com          → / (homepage)"
+  echo "    upload.youtube.com       → /upload/youtube"
+  echo "    i.ytimg.com              → /vi/test.jpg (thumbnail CDN)"
+  echo ""
+  echo "  Log Metrics: playback_errors, upload_failures, transcode_failures"
+  echo ""
+  echo "  Console: https://console.cloud.google.com/monitoring?project=${PROJECT_ID}"
+  echo ""
+}
+
+main() {
+  check_prerequisites
+  enable_apis
+  create_notification_channels
+  create_alert_policies
+  create_uptime_checks
+  create_log_metrics
+  print_summary
+}
+
+main "$@"
